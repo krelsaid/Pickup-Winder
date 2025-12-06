@@ -4,6 +4,8 @@ import configparser
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QDialog, QMessageBox,
                              QTextEdit, QLineEdit, QComboBox, QLabel, QGridLayout, QTabWidget, QGroupBox, QSpinBox, QSlider, QDialogButtonBox)
                              
+
+from PyQt6.QtWidgets import QCheckBox
 from PyQt6.QtCore import QThread, pyqtSignal, QSize, Qt
 from PyQt6.QtGui import QFont
 
@@ -193,6 +195,28 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Speed (steps/sec):"), 3, 0)
         layout.addWidget(self.speed_input, 3, 1)
         layout.addWidget(self.speed_slider, 3, 2)
+        
+        # Winding direction
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItems(["Fwd", "Rev"])
+        layout.addWidget(QLabel("Direction:"), 4, 0)
+        layout.addWidget(self.direction_combo, 4, 1, 1, 2)
+
+        # Motor enable/disable controls
+        motor_control_group = QGroupBox("Motor Toggles")
+        motor_control_layout = QGridLayout()
+
+        self.disable_servo_button = QPushButton("Disable Servo")
+        self.enable_servo_button = QPushButton("Enable Servo")
+        self.disable_stepper_button = QPushButton("Disable Stepper")
+        self.enable_stepper_button = QPushButton("Enable Stepper")
+
+        motor_control_layout.addWidget(self.enable_servo_button, 0, 0)
+        motor_control_layout.addWidget(self.disable_servo_button, 0, 1)
+        motor_control_layout.addWidget(self.enable_stepper_button, 1, 0)
+        motor_control_layout.addWidget(self.disable_stepper_button, 1, 1)
+        motor_control_group.setLayout(motor_control_layout)
+        layout.addWidget(motor_control_group, 5, 0, 1, 3)
 
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Control")
@@ -372,6 +396,14 @@ Date: 12/2/2025"""
         self.resume_button.clicked.connect(lambda: self.send_command_signal.emit("RESUME"))
         self.calc_button.clicked.connect(self.run_calculation)
         self.test_servo_button.clicked.connect(lambda: self.send_command_signal.emit(f"TEST_SERVO {self.test_servo_input.text()}"))
+
+        # Motor enable/disable buttons
+        self.enable_servo_button.clicked.connect(lambda: self.send_command_signal.emit("SERVO_ENABLE 1"))
+        self.disable_servo_button.clicked.connect(lambda: self.send_command_signal.emit("SERVO_ENABLE 0"))
+        self.enable_stepper_button.clicked.connect(lambda: self.send_command_signal.emit("STEPPER_ENABLE 1"))
+        self.disable_stepper_button.clicked.connect(lambda: self.send_command_signal.emit("STEPPER_ENABLE 0"))
+
+
         self.test_stepper_button.clicked.connect(lambda: self.send_command_signal.emit(f"TEST_STEPPER_MOVE {self.test_stepper_input.text()}"))
 
         self.thread.start()
@@ -424,6 +456,10 @@ Date: 12/2/2025"""
         
         # --- Control Tab ---
         for widget in [self.start_button, self.stop_button, self.pause_button, self.resume_button, self.turns_input, self.speed_input, self.speed_slider]:
+            control_widgets = [self.start_button, self.stop_button, self.pause_button, self.resume_button,
+                           self.turns_input, self.speed_input, self.speed_slider, self.direction_combo,
+                           self.enable_servo_button, self.disable_servo_button, self.enable_stepper_button, self.disable_stepper_button]
+        for widget in control_widgets:
             widget.setEnabled(connected)
 
         # --- Calculator Tab ---
@@ -489,22 +525,39 @@ Date: 12/2/2025"""
 
     def start_winding(self):
         turns = self.turns_input.text()
+        direction_cmd="FWD"
         if not (turns.isdigit() and int(turns) > 0):
             logging.warning("Start winding called with invalid turns.")
             return
+
         self.winder_widget.reset_view()
         speed = self.speed_input.value()
         self.winder_widget.target_turns = int(turns)
         self.winder_widget.winding_active = True
         self.send_command_signal.emit(f"S {speed}")
         self.send_command_signal.emit(f"COUNT {turns}")
-        self.send_command_signal.emit("START -V") # Start with verbose mode to get live updates
+        self.send_command_signal.emit(f"DIR {self.direction_combo.currentText().upper()}")
+        self.send_command_signal.emit("START -V" ) # Start with verbose mode to get live updates
 
     def run_calculation(self):
+        resistance_text = self.calc_resistance_input.text().strip().lower()
+        resistance_val = 0
+        try:
+            if not resistance_text.endswith('k') and not resistance_text.endswith('r'):
+                resistance_val = float(resistance_text)
+                # Add 'r' suffix for clarity if it was just a number
+                #self.calc_resistance_input.setText(f"{resistance_text}r")
+                resistance_text += "r"
+            else:
+                resistance_val = float(resistance_text[:-1])
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", f"Invalid resistance value: '{self.calc_resistance_input.text()}'.\nPlease use formats like '6.5k', '5000', or '5000r'.")
+            return
+
         self.send_command_signal.emit(f"WIRE_DIA {self.calc_wire_dia_input.text()}")
         bobbin_cmd = f"BOBBIN {self.calc_bobbin_l_input.text()} {self.calc_bobbin_w_input.text()} {self.calc_bobbin_h_input.text()}"
         self.send_command_signal.emit(bobbin_cmd)
-        self.send_command_signal.emit(f"CALC {self.calc_resistance_input.text()}")
+        self.send_command_signal.emit(f"CALC {resistance_text}")
         # After calculation, the firmware will report the new turn count. We can grab it from the log.
         # A more robust solution would parse "Required Turns" and update the control tab input.
 
@@ -518,7 +571,7 @@ Date: 12/2/2025"""
             self.winder_widget.servo_min_angle = min_angle
             self.winder_widget.servo_max_angle = max_angle
             # Send command to firmware
-            self.send_command_signal.emit(f"SERVO_LIMITS {min_angle} {max_angle}")
+            self.send_command_signal.emit(f"CALIBRATE_SERVO {min_angle} {max_angle}")
         except ValueError:
             logging.warning(f"Invalid servo limits entered: '{min_angle_str}', '{max_angle_str}'")
 

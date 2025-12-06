@@ -480,7 +480,7 @@ void processCommand(char* cmd) {
 
     // Show the status before starting
     printStatus();
-
+	digitalWrite(DIR_PIN, stepperForward ? HIGH : LOW);
     // A new START command always begins from scratch.    
     enableOutputs();
     servoPos = servoMinAngle; // Reset servo to start position
