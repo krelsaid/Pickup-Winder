@@ -1,7 +1,9 @@
 // Name:    pickup_winder.ino
 // Author:  khairil said
 // Date:    1/12/2025
-// Version: 1.0
+// Version: 1.2
+
+#define FIRMWARE_VERSION "1.2.0"
 
 // --- FIRMWARE OVERVIEW ---
 // This firmware controls a guitar pickup coil winder using an Arduino and a CNC shield.
@@ -92,6 +94,16 @@ const byte MAX_CMD_LENGTH = 64;
 char inputBuffer[MAX_CMD_LENGTH];
 byte inputIndex = 0;
 
+// --- Sweep Control ---
+// SWEEP_MODE_FIRMWARE: Uses saved servoMin/MaxAngle and calculated turnsPerLayer.
+// SWEEP_MODE_GUI:      Expects external 'SERVO POS' commands for each turn.
+// SWEEP_MODE_PATTERN:  Uses a temporary pattern sent by the GUI via 'WIND PATTERN'.
+enum SweepControlMode { SWEEP_MODE_FIRMWARE, SWEEP_MODE_GUI, SWEEP_MODE_PATTERN };
+SweepControlMode sweepControlMode = SWEEP_MODE_FIRMWARE; // Default to firmware-driven sweep
+
+float patternMinAngle = 0.0, patternMaxAngle = 0.0, patternScatter = 0.0;
+long patternTurnsPerLayer = 0;
+
 // ==========================
 // EEPROM Addresses
 // ==========================
@@ -106,7 +118,8 @@ int addr = 0;
 #define ADDR_BOBBIN_WID     (addr += sizeof(float))         // After bobbin len (float)
 #define ADDR_BOBBIN_H       (addr += sizeof(float))         // After bobbin wid (float)
 #define ADDR_LAST_CALC_R    (addr += sizeof(float))         // After bobbin h (float)
-#define EEPROM_SIZE         (addr + sizeof(float))          // Final size after all addresses
+#define ADDR_SWEEP_MODE     (addr += sizeof(float))         // After last calc R (float)
+#define EEPROM_SIZE         (addr + sizeof(int))            // Final size after all addresses
 // Note: ADDR_STEPS_PER_TURN is not saved/loaded, so it doesn't need an address.
 // The next available address would be (addr += sizeof(unsigned long))
 
@@ -192,12 +205,45 @@ void updateAndValidate() {
 }
 
 void computeWindingParameters() {
-  turnsPerLayer = (long)(bobbinHeight / wireDiameter); 
-  if (turnsPerLayer <= 0) turnsPerLayer = 1; // Avoid division by zero
-  float sweepAngle = servoMaxAngle - servoMinAngle;
-  servoIncrementPerTurn = sweepAngle / turnsPerLayer;
+  if (wireDiameter > 0) turnsPerLayer = (long)(bobbinHeight / wireDiameter);
   servoPos = servoMinAngle;
-  // Don't move servo here, commands will handle positioning.
+}
+
+// ==========================
+// SERVO POSITIONING
+// ==========================
+void updateServoPosition(long currentStepCount, long totalTurnsInLayer, float minAngle, float maxAngle, float scatterPercent) {
+  long currentTurn = currentStepCount / stepsPerTurn;
+  long layer = currentTurn / totalTurnsInLayer;
+  long turnInLayer = currentTurn % totalTurnsInLayer;
+
+  // Apply scatter to create a margin
+  float angleRange = maxAngle - minAngle;
+  float scatterAmount = angleRange * (scatterPercent / 100.0);
+  float effectiveMin = minAngle + (scatterAmount / 2.0);
+  float effectiveMax = maxAngle - (scatterAmount / 2.0);
+
+  // If there's only one turn (or less) per layer, the servo doesn't need to move.
+  // Position it at the start of the current layer's direction.
+  if (totalTurnsInLayer <= 1) {
+    servoPos = (layer % 2 == 0) ? effectiveMin : effectiveMax;
+    layServo.write((int)servoPos);
+    return;
+  }
+
+  // Calculate the total angular distance the servo needs to travel for one layer.
+  float sweepRange = effectiveMax - effectiveMin;
+
+  // Calculate the small angle change required for each turn (the "pitch").
+  // We divide by (totalTurnsInLayer - 1) because N turns create N-1 intervals of movement.
+  float pitchAngle = sweepRange / (float)(totalTurnsInLayer - 1);
+  
+  if (layer % 2 == 0) { // Even layers (0, 2, 4...): move from effective min to max
+    servoPos = effectiveMin + (turnInLayer * pitchAngle);
+  } else { // Odd layers (1, 3, 5...): move from effective max to min
+    servoPos = effectiveMax - (turnInLayer * pitchAngle);
+  }
+  layServo.write((int)servoPos);
 }
 
 // ==========================
@@ -227,6 +273,7 @@ void saveSettings() {
   EEPROM.put(ADDR_BOBBIN_WID, bobbinWidth);
   EEPROM.put(ADDR_BOBBIN_H, bobbinHeight);
   EEPROM.put(ADDR_LAST_CALC_R, lastCalcRequestedResistance);
+  EEPROM.put(ADDR_SWEEP_MODE, (int)sweepControlMode);
   Serial.println(F("STATUS: Settings saved to EEPROM"));
 }
 
@@ -249,6 +296,7 @@ void loadSettings() {
   EEPROM.get(ADDR_BOBBIN_WID, bobbinWidth);
   EEPROM.get(ADDR_BOBBIN_H, bobbinHeight);
   EEPROM.get(ADDR_LAST_CALC_R, lastCalcRequestedResistance);
+  EEPROM.get(ADDR_SWEEP_MODE, (int&)sweepControlMode);
 
   // --- Sanity Checks for all loaded values ---
 
@@ -312,6 +360,12 @@ void loadSettings() {
   if (isnan(lastCalcRequestedResistance) || lastCalcRequestedResistance < 0.0) {
     lastCalcRequestedResistance = 0.0;
     Serial.println(F("WARN: Invalid last calculated resistance in EEPROM, reset to default."));
+  }
+
+  // Check sweep control mode
+  if (sweepControlMode != SWEEP_MODE_FIRMWARE && sweepControlMode != SWEEP_MODE_GUI) {
+    sweepControlMode = SWEEP_MODE_FIRMWARE; // Default to firmware calculation
+    Serial.println(F("WARN: Invalid sweep control mode in EEPROM, reset to default."));
   }
 
   Serial.println(F("STATUS: Settings loaded from EEPROM"));
@@ -409,6 +463,7 @@ bool checkSerial() {
 
 void printStatus() {
   Serial.println(F("--- CURRENT STATUS ---"));
+  Serial.print(F("Firmware Version: ")); Serial.println(FIRMWARE_VERSION);
   Serial.print(F("Outputs Enabled: ")); Serial.println(outputsEnabled ? F("YES") : F("NO"));
   Serial.print(F("Winding Active: ")); Serial.print(running ? F("YES") : F("NO"));
   if (paused) Serial.print(F(" (PAUSED)"));
@@ -422,6 +477,16 @@ void printStatus() {
   Serial.print(F("Max Speed: ")); Serial.print(speed_sps); Serial.println(F(" steps/sec"));
   Serial.print(F("Initial/Final Speed Delay: ")); Serial.print(initialStepDelay); Serial.println(F(" us"));
   Serial.print(F("Acceleration Steps: ")); Serial.println(accelSteps);
+
+  Serial.print(F("Sweep Control Mode: ")); 
+  if (sweepControlMode == SWEEP_MODE_FIRMWARE) Serial.println(F("FIRMWARE (internal sweep)"));
+  else if (sweepControlMode == SWEEP_MODE_GUI) Serial.println(F("GUI (external SERVO_POS commands)"));
+  else if (sweepControlMode == SWEEP_MODE_PATTERN) {
+    Serial.println(F("PATTERN (GUI-defined pattern)"));
+    Serial.print(F("  - Pattern Params (Min/Max/TPL/Scatter): "));
+    Serial.print(patternMinAngle); Serial.print(F("/")); Serial.print(patternMaxAngle); Serial.print(F("/")); Serial.print(patternTurnsPerLayer); Serial.print(F("/")); Serial.print(patternScatter); Serial.println(F("%"));
+  }
+
 
   Serial.print(F("Turns per Layer: ")); Serial.println(turnsPerLayer);
   Serial.print(F("Wire Diameter: ")); Serial.println(wireDiameter);
@@ -466,10 +531,15 @@ void printStatus() {
 // ==========================
 // SERIAL COMMANDS
 // ==========================
-void processCommand(char* cmd) {
+void processCommand(char* cmd_str) {
   lastCommandTime = millis(); 
 
-  if (strncmp(cmd, "START", 5) == 0) {
+  // Create a mutable copy of the command string for strtok_r to modify.
+  // This prevents modification of the original inputBuffer.
+  char cmd_copy[MAX_CMD_LENGTH];
+  strncpy(cmd_copy, cmd_str, MAX_CMD_LENGTH);
+
+  /*if (strncmp(cmd, "START", 5) == 0) {
     // Check for verbose flag "-V"
     if (strstr(cmd, "-V") != NULL) {
       verboseMode = true;
@@ -480,7 +550,7 @@ void processCommand(char* cmd) {
 
     // Show the status before starting
     printStatus();
-	digitalWrite(DIR_PIN, stepperForward ? HIGH : LOW);
+  digitalWrite(DIR_PIN, stepperForward ? HIGH : LOW);
     // A new START command always begins from scratch.    
     enableOutputs();
     servoPos = servoMinAngle; // Reset servo to start position
@@ -492,70 +562,15 @@ void processCommand(char* cmd) {
     paused = false;
     Serial.println(F("STATUS: Winding STARTED"));
     return;
-  }
+  }*/
 
-  if (strcmp(cmd, "PAUSE") == 0) {
-    if (running) {
-      running = false;
-      paused = true;
-      Serial.println(F("STATUS: Winding PAUSED"));
-    }
+  /*if (strncmp(cmd, "SERVO_POS ", 10) == 0) {
+    float pos = atof(cmd + 10);
+    layServo.write((int)pos);
     return;
-  }
+  }*/
 
-  if (strcmp(cmd, "RESUME") == 0) {
-    if (paused) {
-      enableOutputs();
-      running = true;
-      paused = false;
-      Serial.println(F("STATUS: Winding RESUMED"));
-    }
-    return;
-  }
-
-  if (strcmp(cmd, "STOP") == 0) { 
-    running = false; 
-    verboseMode = false; // Disable verbose mode on stop
-    Serial.println(F("STATUS: Winding STOPPED")); 
-    return; 
-  }
-  if (strncmp(cmd, "COUNT ", 6) == 0) { 
-    targetTurns = atol(cmd + 6); 
-    stepCount = 0; 
-    calculateAvgTurnLength(); // Recalculate with new turn count
-    lastCalcRequestedResistance = 0.0; // Reset, as COUNT overrides CALC
-    Serial.print(F("PARAM: Target turns = ")); Serial.println(targetTurns); return; 
-  }  
-  if (strncmp(cmd, "S ", 2) == 0) {
-    int speed = atoi(cmd + 2);
-    if (speed > 0) {
-      minStepDelay = 1000000UL / speed / 2;
-      Serial.print(F("PARAM: Speed set to ")); Serial.print(speed); Serial.print(F(" steps/sec (delay: ")); Serial.print(minStepDelay); Serial.println(F("us)"));
-    }
-    return;
-  }
-
-  if (strncmp(cmd, "ACCEL ", 6) == 0) {
-    long steps = atol(cmd + 6);
-    if (steps > 0) {
-      accelSteps = steps;
-      Serial.print(F("PARAM: Acceleration steps set to ")); Serial.println(accelSteps);
-    }
-    return;
-  }
-
-  if (strncmp(cmd, "SPEED ", 6) == 0) {
-    int delay = atoi(cmd + 6);
-    if (delay > minStepDelay) { // Must be slower than max speed
-      initialStepDelay = delay;
-      Serial.print(F("PARAM: Initial step delay set to ")); Serial.print(initialStepDelay); Serial.println(F("us"));
-    } else {
-      Serial.println(F("ERROR: Initial delay must be greater than min step delay."));
-    }
-    return;
-  }
-
-  if (strncmp(cmd, "CALIBRATE_SERVO ", 16) == 0) {
+  /*if (strncmp(cmd, "CALIBRATE_SERVO ", 16) == 0) {
     char* minStr = cmd + 16;
     enableOutputs();
     char* maxStr = strchr(minStr, ' ');
@@ -572,17 +587,17 @@ void processCommand(char* cmd) {
     layServo.write((int)servoMinAngle);
     disableOutputs();
     return;
-  }
+  }*/
 
-  if (strncmp(cmd, "TEST_SERVO ", 11) == 0) {
+  /*if (strncmp(cmd, "TEST_SERVO ", 11) == 0) {
     enableServo();
     layServo.write(atoi(cmd + 11));
     Serial.println(F("STATUS: Servo moved."));
     delay(500); // Give servo time to move to position before detaching
     disableServo();
     return;
-  }
-  if (strncmp(cmd, "TEST_LAYER", 10) == 0) {
+  }*/
+  if (strncmp(cmd_copy, "TEST_LAYER", 10) == 0) {
     // Default test values, using current configuration
     long testTurns = turnsPerLayer;
     int testMinStepDelay = minStepDelay;
@@ -591,8 +606,9 @@ void processCommand(char* cmd) {
     bool resume = false;
 
     // New parser for arguments like C8000 S50 A20
-    char* args = cmd + 10;
-    char* token = strtok(args, " "); // Use a local running flag for parsing
+    char *saveptr;
+    char* args = cmd_copy + 10;
+    char* token = strtok_r(args, " ", &saveptr); // Use a local running flag for parsing
     while (token != NULL) {
         switch (token[0]) {
             case 'S': // Speed (Steps/sec)
@@ -620,14 +636,8 @@ void processCommand(char* cmd) {
                 }
                 break;
         }
-        token = strtok(NULL, " ");
+        token = strtok_r(NULL, " ", &saveptr);
     }
-
-    // --- FIX: Calculate a local servo increment for this specific test ---
-    float testSweepAngle = testMaxAngle - testMinAngle;
-    float testServoIncrement = testSweepAngle / testTurns;
-    if (testTurns <= 0) testServoIncrement = 0; // Avoid division by zero
-    // ---
 
     if (!resume) {
         servoPos = testMinAngle; // Reset servo to start position unless resuming
@@ -669,160 +679,16 @@ void processCommand(char* cmd) {
             Serial.print(F(" | Servo Pos: "));
             Serial.println(servoPos);
 
-            // Move servo to position for the NEXT turn
-            servoPos += testServoIncrement;
-            if (servoPos >= testMaxAngle || servoPos <= testMinAngle) { testServoIncrement = -testServoIncrement; }
-            layServo.write((int)servoPos);
+            updateServoPosition(stepCount, testTurns, testMinAngle, testMaxAngle, 0); // No scatter for this test
         }
     }
     Serial.println(running ? F("STATUS: Layer test done.") : F("STATUS: Test STOPPED."));
     running = false; // Ensure running is false after test
     disableOutputs();
-    return;
-  }  
-
-  if (strcmp(cmd, "ENABLE") == 0) { enableOutputs(); return; }
-  if (strcmp(cmd, "DISABLE") == 0) { disableOutputs(); return; }
-  if (strcmp(cmd, "DISABLE_STEPPER") == 0) { digitalWrite(EN_PIN,HIGH); Serial.println(F("STATUS: Stepper DISABLED")); return; }
-  if (strcmp(cmd, "ENABLE_STEPPER") == 0) { digitalWrite(EN_PIN,LOW); Serial.println(F("STATUS: Stepper ENABLED")); return; }
-  if (strcmp(cmd, "DISABLE_SERVO") == 0) { if(layServo.attached()) layServo.detach(); Serial.println(F("STATUS: Servo DISABLED")); return; }
-  if (strcmp(cmd, "ENABLE_SERVO") == 0) { if(!layServo.attached()) layServo.attach(SERVO_PIN); Serial.println(F("STATUS: Servo ENABLED")); return; }
-
-  if (strcmp(cmd, "SAVE") == 0) { saveSettings(); return; }
-  if (strcmp(cmd, "LOAD") == 0) { loadSettings(); updateAndValidate(); return; }
-
-  if (strncmp(cmd, "TIMEOUT ", 8) == 0) { timeoutLimit = atol(cmd + 8); Serial.print(F("PARAM: Timeout = ")); Serial.println(timeoutLimit); return; }
-
-  if (strncmp(cmd, "DIR ", 4) == 0) { stepperForward = (strcmp(cmd + 4, "FWD") == 0); Serial.print(F("PARAM: Stepper direction = ")); Serial.println(stepperForward ? "FWD" : "REV"); return; }
-
-  if (strncmp(cmd, "WIRE_DIA ", 9) == 0) {
-    wireDiameter = atof(cmd + 9);
-    updateAndValidate(); // Validate & re-calculate dependent params
-    calculateAvgTurnLength(); // Recalculate turn length    
-    Serial.print(F("PARAM: Wire diameter = ")); Serial.println(wireDiameter);
-    return;
-  }
-  
-  if (strncmp(cmd, "BOBBIN ", 7) == 0) {
-    char* l_str = cmd + 7;
-    char* w_str = strchr(l_str, ' ');
-    char* h_str = (w_str != NULL) ? strchr(w_str + 1, ' ') : NULL;
-
-    if (h_str == NULL) {
-      Serial.println(F("ERROR: Invalid BOBBIN format. Use: BOBBIN <len> <wid> <hgt>"));
-      return;
-    }
-    *w_str = '\0';
-    *h_str = '\0'; // h_str points to the space before the height value
-
-    // --- FIX: Validate that all three values are present before assigning ---
-    float l = atof(l_str);
-    float w = atof(w_str + 1);
-    float h = atof(h_str + 1);
-
-    if (l <= 0 || w <= 0 || h <= 0) {
-      Serial.println(F("ERROR: Bobbin dimensions must be positive numbers."));
-      return;
-    }
-
-    bobbinLength = l;
-    bobbinWidth = w;
-    bobbinHeight = h;
-
-    updateAndValidate(); // Validate new dimensions and re-calc turnsPerLayer
-    calculateAvgTurnLength(); // Calculate the avg turn length from new dimensions
-
-    Serial.println(F("PARAM: Bobbin dimensions updated:"));
-    Serial.print(F("  - Length: ")); Serial.print(bobbinLength); Serial.println(F(" mm"));
-    Serial.print(F("  - Width: ")); Serial.print(bobbinWidth); Serial.println(F(" mm"));
-    Serial.print(F("  - Height: ")); Serial.print(bobbinHeight); Serial.println(F(" mm"));    
-    if (avgTurnLength > 0) {
-      Serial.print(F("  - Calculated Avg Turn Length: ")); Serial.print(avgTurnLength); Serial.println(F(" mm"));
-    } else {
-      Serial.println(F("  - Avg Turn Length will be calculated after setting COUNT."));
-    }
-    return;
+    return; 
   }
 
-  if (strncmp(cmd, "CALC ", 5) == 0) {
-    // --- Intelligent check for required parameters ---
-    bool ready = true;
-    if (bobbinLength <= 0 || bobbinWidth <= 0 || bobbinHeight <= 0) {
-      Serial.println(F("ERROR: Bobbin dimensions not set. Use: BOBBIN <L> <W> <H>"));
-      ready = false;
-    }
-    if (wireDiameter <= 0) {
-      Serial.println(F("ERROR: Wire diameter not set. Use: WIRE_DIA <mm>"));
-      ready = false;
-    }
-    if (!ready) return;
-    // ---
-
-    char* val_str = cmd + 5;
-    float targetResistance = atof(val_str);
-    char unit = toupper(val_str[strlen(val_str) - 1]);
-
-    if (unit == 'K') {
-      targetResistance *= 1000.0;
-    } else if (unit != 'R') {
-      Serial.println(F("ERROR: Invalid CALC format. Use: CALC <value>R or CALC <value>K"));
-      return;
-    }
-
-    if (targetResistance <= 0) {
-      Serial.println(F("ERROR: Target resistance must be positive."));
-      return;
-    }
-
-    Serial.print(F("INFO: Calculating turns for ")); Serial.print(targetResistance, 2); Serial.println(F(" Ohms..."));
-    lastCalcRequestedResistance = targetResistance; // Store the requested resistance
-
-    // --- Iterative calculation to find targetTurns ---
-    const float COPPER_RESISTIVITY = 1.68E-8; // Ohm-meters (Ω·m)
-    float radius_m = (wireDiameter / 2.0) / 1000.0;
-    float area_m2 = PI * radius_m * radius_m;
-
-    long calculatedTurns = 1000; // Start with a guess
-    for (int i = 0; i < 10; i++) { // Iterate a few times for convergence
-      // Temporarily set targetTurns to calculate the avgTurnLength for this iteration
-      targetTurns = calculatedTurns;
-      calculateAvgTurnLength();
-
-      if (avgTurnLength <= 0) { // Should not happen if params are set
-        Serial.println(F("ERROR: Could not calculate average turn length."));
-        targetTurns = 0; // Reset
-        return;
-      }
-
-      // Reverse the resistance formula to solve for turns
-      // R = ρ * (L/A) => L = R*A/ρ
-      // L = turns * avg_len => turns = L / avg_len
-      float totalLength_m = (targetResistance * area_m2) / COPPER_RESISTIVITY;
-      calculatedTurns = (long)((totalLength_m * 1000.0) / avgTurnLength);
-    }
-
-    // Final update with the calculated turns
-    targetTurns = calculatedTurns;
-    calculateAvgTurnLength(); // Final calculation for avgTurnLength
-    float finalLength_m = (float)targetTurns * avgTurnLength / 1000.0;
-
-    Serial.println(F("--- CALCULATION RESULTS ---"));
-    Serial.println(F("  Inputs:"));
-    Serial.print(F("  - Target Resistance: ")); Serial.print(targetResistance, 2); Serial.println(F(" Ohms"));
-    Serial.print(F("  - Bobbin (L/W/H):  ")); Serial.print(bobbinLength); Serial.print(F("/")); Serial.print(bobbinWidth); Serial.print(F("/")); Serial.print(bobbinHeight); Serial.println(F(" mm"));
-    Serial.print(F("  - Wire Diameter:     ")); Serial.print(wireDiameter); Serial.println(F(" mm"));
-    float ohm_per_meter = COPPER_RESISTIVITY / area_m2;
-    Serial.print(F("  - Wire Resistance:   ")); Serial.print(ohm_per_meter, 2); Serial.println(F(" Ohm/meter"));
-    Serial.println(F("  Outputs:"));
-    Serial.print(F("  - Required Turns:    ")); Serial.println(targetTurns);
-    Serial.print(F("  - Est. Wire Length:  ")); Serial.print(finalLength_m, 2); Serial.println(F(" meters"));
-    Serial.println(F("---------------------------"));
-    Serial.println(F("STATUS: Target turns updated."));
-
-    return;
-  }
-
-  if (strcmp(cmd, "TEST_STEPPER") == 0) {
+  if (strcmp(cmd_copy, "TEST_STEPPER") == 0) {
     enableOutputs();
     Serial.println(F("INFO: Stepper buzz test (50 steps)..."));
     digitalWrite(DIR_PIN, HIGH); // Use a consistent direction
@@ -836,19 +702,20 @@ void processCommand(char* cmd) {
   }
 
   // TEST_STEPPER_MOVE with SPEED support
-  if (strncmp(cmd, "TEST_STEPPER_MOVE ", 18) == 0) {
+  if (strncmp(cmd_copy, "TEST_STEPPER_MOVE ", 18) == 0) {
     long stepsToMove = 1600; // Default: one revolution at 1/8 microstepping
     int speed = 1000; // Default speed in steps/sec
     bool dirFwd = true;
 
-    char* args = cmd + 18;
-    char* token = strtok(args, " ");
+    char *saveptr;
+    char* args = cmd_copy + 18;
+    char* token = strtok_r(args, " ", &saveptr);
     while (token != NULL) {
         if (strcmp(token, "FWD") == 0) dirFwd = true;
         else if (strcmp(token, "REV") == 0) dirFwd = false;
         else if (token[0] == 'S' && isdigit(token[1])) speed = atoi(token + 1);
         else if (isdigit(token[0])) stepsToMove = atol(token);
-        token = strtok(NULL, " ");
+        token = strtok_r(NULL, " ", &saveptr);
     }
 
     if (speed <= 0) speed = 1000; // Safety check for speed
@@ -869,7 +736,7 @@ void processCommand(char* cmd) {
     return;
   }
 
-  if (strcmp(cmd, "RESTORE_DEFAULTS") == 0) {
+  if (strcmp(cmd_copy, "RESTORE_DEFAULTS") == 0) {
     Serial.println(F("INFO: Restoring all settings to factory defaults."));
     clearEEPROM();
     // Re-initialize variables to their hardcoded defaults by calling setup functions
@@ -879,15 +746,326 @@ void processCommand(char* cmd) {
     saveSettings(); // Persist the fresh defaults
     return;
   }
-  if (strcmp(cmd, "STATUS") == 0) {
+  if (strcmp(cmd_copy, "STATUS") == 0) {
     printStatus();
     return;
   }
 
-  if (strcmp(cmd, "HELP") == 0) {
-    Serial.println(F(
-      "Commands:\nSTART [-V]\nSTOP\nPAUSE\nRESUME\nSTATUS\nRESTORE_DEFAULTS\nCOUNT <turns>\nS <steps/sec>\nSPEED <delay_us>\nACCEL <steps>\nCALIBRATE_SERVO <min> <max>\nTEST_SERVO <angle>\nTEST_LAYER [S<speed>] [C<turns>] [A<angle>] [R1]\nENABLE\nDISABLE\nSAVE\nLOAD\nTIMEOUT <ms>\nDIR <FWD/REV>\nWIRE_DIA <mm>\nBOBBIN <L> <W> <H>\nCALC <val>R/K\nHELP"
-    ));
+  char *saveptr;
+  char* component = strtok_r(cmd_copy, " ", &saveptr);
+  if (component == NULL) return;
+
+  char* action = strtok_r(NULL, " ", &saveptr);
+  if (action == NULL) action = "STATUS"; // Default action is to get status
+
+  // ================== WIND ==================
+  if (strcmp(component, "WIND") == 0) {
+    if (strcmp(action, "START") == 0) {      char* arg = strtok_r(NULL, " ", &saveptr);
+      verboseMode = (arg != NULL && strcmp(arg, "-V") == 0);
+      if(verboseMode) Serial.println(F("INFO: Verbose mode enabled."));
+      
+      printStatus();
+      digitalWrite(DIR_PIN, stepperForward ? HIGH : LOW);
+      enableOutputs();
+
+      // Set the correct starting position based on the sweep mode
+      if (sweepControlMode == SWEEP_MODE_PATTERN) {
+        servoPos = patternMinAngle;
+      } else {
+        servoPos = servoMinAngle;
+      }
+      layServo.write((int)servoPos);
+      delay(500); // Increased delay to give servo ample time to move
+      totalSteps = targetTurns * stepsPerTurn;
+      stepCount = 0;
+      running = true;
+      paused = false;
+      Serial.println(F("STATUS: Winding STARTED"));
+    } else if (strcmp(action, "STOP") == 0) {
+      running = false;
+      verboseMode = false;
+      Serial.println(F("STATUS: Winding STOPPED"));
+    } else if (strcmp(action, "PAUSE") == 0) {
+      if (running) { running = false; paused = true; Serial.println(F("STATUS: Winding PAUSED")); }
+    } else if (strcmp(action, "RESUME") == 0) {
+      if (paused) { enableOutputs(); running = true; paused = false; Serial.println(F("STATUS: Winding RESUMED")); }
+    } else if (strcmp(action, "COUNT") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        targetTurns = atol(val);
+        stepCount = 0;
+        calculateAvgTurnLength();
+        lastCalcRequestedResistance = 0.0;
+        Serial.print(F("PARAM: Target turns = ")); Serial.println(targetTurns);
+      }
+    } else if (strcmp(action, "SPEED") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        int speed = atoi(val);
+        if (speed > 0) {
+          minStepDelay = 1000000UL / speed / 2;
+          Serial.print(F("PARAM: Speed set to ")); Serial.print(speed); Serial.print(F(" steps/sec (delay: ")); Serial.print(minStepDelay); Serial.println(F("us)"));
+        }
+      }
+    } else if (strcmp(action, "DIR") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        stepperForward = (strcmp(val, "FWD") == 0);
+        Serial.print(F("PARAM: Stepper direction = ")); Serial.println(stepperForward ? "FWD" : "REV");
+      }
+    } else if (strcmp(action, "SWEEP") == 0) {
+      char* mode = strtok_r(NULL, " ", &saveptr);
+      if (strcmp(mode, "FIRMWARE") == 0) {
+        sweepControlMode = SWEEP_MODE_FIRMWARE;
+        Serial.println(F("PARAM: Sweep control set to FIRMWARE."));
+      } else if (strcmp(mode, "GUI") == 0) {
+        sweepControlMode = SWEEP_MODE_GUI;
+        Serial.println(F("PARAM: Sweep control set to GUI."));
+      }
+      else if (strcmp(mode, "PATTERN") == 0) {
+        sweepControlMode = SWEEP_MODE_PATTERN;
+        Serial.println(F("PARAM: Sweep control set to PATTERN."));
+      }
+    } else if (strcmp(action, "PATTERN") == 0) {
+      char* min_str = strtok_r(NULL, " ", &saveptr);
+      char* max_str = strtok_r(NULL, " ", &saveptr);
+      char* tpl_str = strtok_r(NULL, " ", &saveptr);
+      char* scatter_str = strtok_r(NULL, " ", &saveptr);
+      if (min_str && max_str && tpl_str && scatter_str) {
+        patternMinAngle = atof(min_str); patternMaxAngle = atof(max_str); patternTurnsPerLayer = atol(tpl_str); patternScatter = atof(scatter_str);
+        Serial.println(F("PARAM: Sweep pattern received."));
+      }
+    } else if (strcmp(action, "SCATTER") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        patternScatter = atof(val);
+        Serial.print(F("PARAM: Live scatter updated to "));
+        Serial.println(patternScatter);
+      }
+    }
+    return;
+  }
+
+  // ================== SERVO ==================
+  if (strcmp(component, "SERVO") == 0) {
+    if (strcmp(action, "STATUS") == 0) {
+      Serial.print(F("SERVO_STATUS:"));
+      Serial.print(layServo.attached() ? " ENABLED" : " DISABLED");
+      Serial.print(F(" | POS: ")); Serial.println(servoPos);
+    } else if (strcmp(action, "ENABLE") == 0) {
+      enableServo();
+      Serial.println(F("STATUS: Servo ENABLED"));
+    } else if (strcmp(action, "DISABLE") == 0) {
+      disableServo();
+      Serial.println(F("STATUS: Servo DISABLED"));
+    } else if (strcmp(action, "POS") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        servoPos = atof(val);
+        if (!layServo.attached()) enableServo();
+        layServo.write((int)servoPos);
+        Serial.print(F("STATUS: Servo moved to ")); Serial.println(servoPos);
+      }
+    } else if (strcmp(action, "CALIBRATE") == 0) {
+      char* minStr = strtok_r(NULL, " ", &saveptr);
+      char* maxStr = strtok_r(NULL, " ", &saveptr);
+      if (minStr && maxStr) {
+        enableOutputs();
+        servoMinAngle = atof(minStr);
+        servoMaxAngle = atof(maxStr);
+        updateAndValidate();
+        Serial.print(F("PARAM: Servo Min/Max Angle = ")); Serial.print(servoMinAngle); Serial.print("/"); Serial.println(servoMaxAngle);
+        layServo.write((int)servoMinAngle); delay(200);
+        layServo.write((int)servoMaxAngle); delay(200);
+        layServo.write((int)servoMinAngle);
+        disableOutputs();
+      } else {
+        Serial.println(F("ERROR: Invalid format. Use: SERVO CALIBRATE <min> <max>"));
+      }
+    }
+    return;
+  }
+
+  // ================== STEPPER ==================
+  if (strcmp(component, "STEPPER") == 0) {
+    if (strcmp(action, "STATUS") == 0) {
+      // EN_PIN is LOW for enabled, HIGH for disabled.
+      Serial.print(F("STEPPER_STATUS:"));
+      Serial.println(digitalRead(EN_PIN) == LOW ? " ENABLED" : " DISABLED");
+    } else if (strcmp(action, "ENABLE") == 0) {
+      digitalWrite(EN_PIN, LOW);
+      Serial.println(F("STATUS: Stepper ENABLED"));
+    } else if (strcmp(action, "DISABLE") == 0) {
+      digitalWrite(EN_PIN, HIGH);
+      Serial.println(F("STATUS: Stepper DISABLED"));
+    } else if (strcmp(action, "MOVE") == 0) {
+      char* val = strtok_r(NULL, " ", &saveptr);
+      if (val) {
+        long stepsToMove = atol(val);
+        unsigned long stepDelayHalf = minStepDelay; // Use current speed
+        Serial.print(F("INFO: Stepper moving ")); Serial.print(stepsToMove); Serial.println(F(" steps..."));
+        enableOutputs();
+        digitalWrite(DIR_PIN, stepperForward ? HIGH : LOW);
+        for (long i = 0; i < stepsToMove; i++) {
+          digitalWrite(STEP_PIN, HIGH);
+          delayMicroseconds(stepDelayHalf);
+          digitalWrite(STEP_PIN, LOW);
+          delayMicroseconds(stepDelayHalf);
+        }
+        Serial.println(F("STATUS: Stepper move completed."));
+        disableOutputs();
+      }
+    }
+    return;
+  }
+
+  // ================== SYS ==================
+  if (strcmp(component, "SYS") == 0) {
+    if (strcmp(action, "STATUS") == 0) {
+      printStatus();
+    } else if (strcmp(action, "SAVE") == 0) {
+      saveSettings();
+    } else if (strcmp(action, "LOAD") == 0) {
+      loadSettings();
+      updateAndValidate();
+    } else if (strcmp(action, "RESET") == 0) {
+      Serial.println(F("INFO: Restoring all settings to factory defaults."));
+      clearEEPROM();
+      loadSettings();
+      lastCalcRequestedResistance = 0.0;
+      updateAndValidate();
+      saveSettings();
+    } else if (strcmp(action, "VERSION") == 0) {
+      Serial.print(F("FIRMWARE_VERSION: "));
+      Serial.println(FIRMWARE_VERSION);
+    } else if (strcmp(action, "HELP") == 0) {
+      Serial.println(F(
+        "Commands:\n"
+        "WIND [START|STOP|PAUSE|RESUME|COUNT|SPEED|DIR|SWEEP]\n"
+        "SERVO [STATUS|ENABLE|DISABLE|POS|CALIBRATE]\n"
+        "STEPPER [STATUS|ENABLE|DISABLE|MOVE]\n"
+        "SYS [STATUS|SAVE|LOAD|RESET|VERSION|HELP]\n"
+        "BOBBIN <L> <W> <H>\n"
+        "WIRE_DIA <mm>\n"
+        "CALC <val>R/K"
+      ));
+    }
+    return;
+  }
+
+  // ================== BOBBIN ==================
+  if (strcmp(component, "BOBBIN") == 0) {
+    char* l_str = action; // The first value is already in 'action'
+    char* w_str = strtok_r(NULL, " ", &saveptr);
+    char* h_str = strtok_r(NULL, " ", &saveptr);
+
+    if (l_str == NULL || w_str == NULL || h_str == NULL) {
+      Serial.println(F("ERROR: Invalid BOBBIN format. Use: BOBBIN <len> <wid> <hgt>"));
+      return;
+    }
+    float l = atof(l_str);
+    float w = atof(w_str);
+    float h = atof(h_str);
+
+    if (l <= 0 || w <= 0 || h <= 0) {
+      Serial.println(F("ERROR: Bobbin dimensions must be positive numbers."));
+      return;
+    }
+
+    bobbinLength = l;
+    bobbinWidth = w;
+    bobbinHeight = h;
+
+    updateAndValidate();
+    calculateAvgTurnLength();
+
+    Serial.println(F("PARAM: Bobbin dimensions updated:"));
+    Serial.print(F("  - Length: ")); Serial.print(bobbinLength); Serial.println(F(" mm"));
+    Serial.print(F("  - Width: ")); Serial.print(bobbinWidth); Serial.println(F(" mm"));
+    Serial.print(F("  - Height: ")); Serial.print(bobbinHeight); Serial.println(F(" mm"));
+    return;
+  }
+
+  // ================== WIRE_DIA ==================
+  if (strcmp(component, "WIRE_DIA") == 0) {
+    if (action) { // The value is in the 'action' variable
+      wireDiameter = atof(action);
+      updateAndValidate();
+      calculateAvgTurnLength();
+      Serial.print(F("PARAM: Wire diameter = ")); Serial.println(wireDiameter);
+    }
+    return;
+  }
+
+  // ================== CALC ==================
+  if (strcmp(component, "CALC") == 0) {
+    bool ready = true;
+    if (bobbinLength <= 0 || bobbinWidth <= 0 || bobbinHeight <= 0) {
+      Serial.println(F("ERROR: Bobbin dimensions not set. Use: BOBBIN <L> <W> <H>"));
+      ready = false;
+    }
+    if (wireDiameter <= 0) {
+      Serial.println(F("ERROR: Wire diameter not set. Use: WIRE_DIA <mm>"));
+      ready = false;
+    }
+    if (!ready) return;
+
+    if (!action) return; // The value is in the 'action' variable
+
+    float targetResistance = atof(action);
+    char unit = toupper(action[strlen(action) - 1]);
+
+    if (unit == 'K') {
+      targetResistance *= 1000.0;
+    } else if (unit != 'R') {
+      Serial.println(F("ERROR: Invalid CALC format. Use: CALC <value>R or CALC <value>K"));
+      return;
+    }
+
+    if (targetResistance <= 0) {
+      Serial.println(F("ERROR: Target resistance must be positive."));
+      return;
+    }
+
+    Serial.print(F("INFO: Calculating turns for ")); Serial.print(targetResistance, 2); Serial.println(F(" Ohms..."));
+    lastCalcRequestedResistance = targetResistance;
+
+    const float COPPER_RESISTIVITY = 1.68E-8;
+    float radius_m = (wireDiameter / 2.0) / 1000.0;
+    float area_m2 = PI * radius_m * radius_m;
+
+    long calculatedTurns = 1000;
+    for (int i = 0; i < 10; i++) {
+      targetTurns = calculatedTurns;
+      calculateAvgTurnLength();
+
+      if (avgTurnLength <= 0) {
+        Serial.println(F("ERROR: Could not calculate average turn length."));
+        targetTurns = 0;
+        return;
+      }
+
+      float totalLength_m = (targetResistance * area_m2) / COPPER_RESISTIVITY;
+      calculatedTurns = (long)((totalLength_m * 1000.0) / avgTurnLength);
+    }
+
+    targetTurns = calculatedTurns;
+    calculateAvgTurnLength();
+    float finalLength_m = (float)targetTurns * avgTurnLength / 1000.0;
+
+    Serial.println(F("--- CALCULATION RESULTS ---"));
+    Serial.println(F("  Inputs:"));
+    Serial.print(F("  - Target Resistance: ")); Serial.print(targetResistance, 2); Serial.println(F(" Ohms"));
+    Serial.print(F("  - Bobbin (L/W/H):  ")); Serial.print(bobbinLength); Serial.print(F("/")); Serial.print(bobbinWidth); Serial.print(F("/")); Serial.print(bobbinHeight); Serial.println(F(" mm"));
+    Serial.print(F("  - Wire Diameter:     ")); Serial.print(wireDiameter); Serial.println(F(" mm"));
+    float ohm_per_meter = COPPER_RESISTIVITY / area_m2;
+    Serial.print(F("  - Wire Resistance:   ")); Serial.print(ohm_per_meter, 2); Serial.println(F(" Ohm/meter"));
+    Serial.println(F("  Outputs:"));
+    Serial.print(F("  - Required Turns:    ")); Serial.println(targetTurns);
+    Serial.print(F("  - Est. Wire Length:  ")); Serial.print(finalLength_m, 2); Serial.println(F(" meters"));
+    Serial.println(F("---------------------------"));
+    Serial.println(F("STATUS: Target turns updated."));
+
     return;
   }
 
@@ -918,11 +1096,13 @@ void loop() {
         Serial.println(servoPos);
       }
       
+      // Only run internal sweep logic if in FIRMWARE mode
       if (stepCount > 0 && stepCount % stepsPerTurn == 0) {
-        // Move servo to position for the NEXT turn
-        servoPos += servoIncrementPerTurn;
-        if (servoPos >= servoMaxAngle || servoPos <= servoMinAngle) { servoIncrementPerTurn = -servoIncrementPerTurn; }
-        layServo.write(servoPos);
+          if (sweepControlMode == SWEEP_MODE_FIRMWARE) {
+              updateServoPosition(stepCount, turnsPerLayer, servoMinAngle, servoMaxAngle, 0); // 0 scatter for default firmware mode
+          } else if (sweepControlMode == SWEEP_MODE_PATTERN) {
+              updateServoPosition(stepCount, patternTurnsPerLayer, patternMinAngle, patternMaxAngle, patternScatter);
+          }
       }
     }
     
