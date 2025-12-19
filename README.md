@@ -122,6 +122,7 @@ This project requires Python 3 and the following library:
 
 ```bash
 pip install PyQt6
+pip install pyserial
 ```
 
 The physical winder itself would likely be controlled by a microcontroller (like an Arduino or ESP32) running its own firmware, communicating with this Python application over a serial port.
